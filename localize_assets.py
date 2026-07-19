@@ -3,12 +3,24 @@
 Localiza assets de Framer (imagenes, fuentes, videos, y los modulos .mjs
 que arman el sitio) que quedaron referenciados con URL completa
 (framerusercontent.com, etc.) despues de exportar, y los reemplaza por
-copias locales dentro del repo.
+copias locales dentro del repo. Tambien quita el widget promocional
+("Remix for $0") de la plantilla.
 
 Iterativo: los .mjs descargados pueden importar otros .mjs remotos, asi
 que se repite el escaneo sobre los archivos recien descargados hasta que
 no aparezcan URLs nuevas.
+
+CAMBIOS respecto a la version anterior:
+- Se agrego "framer.com" (dominio pelado) a FRAMER_DOMAINS: los exports
+  suelen traer un <script type="module" src="https://framer.com/m/..."> 
+  para animaciones/interacciones que antes no se cazaba.
+- El borrado del widget promocional ya NO depende del nombre de clase
+  con hash (framer-wctl1-container), que cambia en cada export/plantilla.
+  Ahora se ancla en el link fijo hacia el marketplace de templates
+  (avathiery.com/framer-templates) y borra el <div> que lo contiene
+  usando conteo de profundidad de etiquetas, no texto literal.
 """
+
 import os
 import re
 import subprocess
@@ -22,6 +34,7 @@ FRAMER_DOMAINS = [
     "framerstatic.com",
     "framercdn.com",
     "framer.app",
+    "framer.com",
     "events.framer.com",
     "api.framer.com",
     "jspm.io",
@@ -51,9 +64,14 @@ HEADERS = {
     "Referer": "https://framer.com/",
 }
 
-PROMO_START = '<div class="framer-wctl1-container">'
-PROMO_END = '<div id="template-overlay"></div><!--/$--></div>'
-PROMO_PATTERN = re.compile(re.escape(PROMO_START) + r'.*?' + re.escape(PROMO_END), re.DOTALL)
+# Marcador estable para encontrar el widget promocional: el link hacia
+# el marketplace de templates casi nunca cambia de dominio, a diferencia
+# de las clases CSS con hash que se regeneran en cada export.
+PROMO_LINK_MARKERS = [
+    "framer-templates",       # ej. avathiery.com/framer-templates
+    "framer.com/marketplace",
+    "framer.com/templates",
+]
 
 
 def should_skip(url):
@@ -126,6 +144,33 @@ def replace_in_files(files, url_map):
     return changed_files
 
 
+def _remove_enclosing_div(content, marker_pos, tag="div"):
+    """Busca el <div> mas cercano que engloba la posicion `marker_pos`
+    y lo borra por completo, contando profundidad de apertura/cierre
+    en vez de depender de un nombre de clase fijo."""
+    tag_re = re.compile(r"<" + tag + r"(?:\s[^>]*)?>|</" + tag + r">")
+    stack = []
+    for m in tag_re.finditer(content, 0, marker_pos):
+        if m.group().startswith("</"):
+            if stack:
+                stack.pop()
+        else:
+            stack.append(m.start())
+    if not stack:
+        return content, False
+    start = stack[-1]
+    depth = 0
+    for m in tag_re.finditer(content, start):
+        if m.group().startswith("</"):
+            depth -= 1
+            if depth == 0:
+                end = m.end()
+                return content[:start] + content[end:], True
+        else:
+            depth += 1
+    return content, False
+
+
 def remove_promo_widget(files):
     removed_from = []
     for path in files:
@@ -136,11 +181,29 @@ def remove_promo_widget(files):
                 content = fh.read()
         except OSError:
             continue
-        new_content, n = PROMO_PATTERN.subn("", content)
-        if n:
+        original = content
+        count = 0
+        # Puede aparecer varias veces (una por breakpoint). Se repite
+        # hasta que no quede ningun marcador conocido.
+        while True:
+            pos = -1
+            for marker in PROMO_LINK_MARKERS:
+                idx = content.find(marker)
+                if idx != -1:
+                    pos = idx
+                    break
+            if pos == -1:
+                break
+            new_content, ok = _remove_enclosing_div(content, pos)
+            if not ok or new_content == content:
+                # No se pudo aislar un <div> valido: evita bucle infinito.
+                break
+            content = new_content
+            count += 1
+        if count:
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write(new_content)
-            removed_from.append((path, n))
+                fh.write(content)
+            removed_from.append((path, count))
     return removed_from
 
 
@@ -166,7 +229,6 @@ def main():
             break
 
         print(f"Iteracion {iteration}: {len(new_urls)} URLs nuevas encontradas.")
-
         for url in new_urls:
             if should_skip(url):
                 print(f"  Omitido (endpoint de analitica, no es un archivo): {url}")
